@@ -46,6 +46,22 @@
       letter-spacing: 0.04em;
       text-transform: uppercase;
     }
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .lang-btn {
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .lang-btn:hover { background: rgba(255,255,255,0.12); color: var(--text); }
     .status-pill {
       padding: 8px 14px;
       border-radius: 999px;
@@ -138,44 +154,47 @@
   <div class="shell">
     <div class="topbar">
       <div class="title">Poly Arb</div>
-      <div class="status-pill" id="bot-status">starting</div>
+      <div class="topbar-right">
+        <button class="lang-btn" id="lang-toggle" onclick="toggleLang()">中文</button>
+        <div class="status-pill" id="bot-status">starting</div>
+      </div>
     </div>
 
     <div class="grid">
       <section class="panel">
-        <div class="label">Tracked Markets</div>
+        <div class="label" data-i18n="tracked_markets">Tracked Markets</div>
         <div class="metric" id="tracked-markets">0</div>
       </section>
       <section class="panel">
-        <div class="label">Tracked Books</div>
+        <div class="label" data-i18n="tracked_books">Tracked Books</div>
         <div class="metric" id="tracked-books">0</div>
       </section>
       <section class="panel">
-        <div class="label">Today PnL</div>
+        <div class="label" data-i18n="today_pnl">Today PnL</div>
         <div class="metric" id="today-profit">$0.00</div>
       </section>
       <section class="panel">
-        <div class="label">Lifetime Profit</div>
+        <div class="label" data-i18n="lifetime_profit">Lifetime Profit</div>
         <div class="metric" id="lifetime-profit">$0.00</div>
       </section>
     </div>
 
     <div class="hero">
       <section class="panel">
-        <div class="label">Live Orderbook</div>
+        <div class="label" data-i18n="live_orderbook">Live Orderbook</div>
         <div style="display:flex; gap:24px; align-items:baseline; margin-bottom:14px;">
           <div>
-            <div class="label" style="margin-bottom:4px">Ask Up</div>
+            <div class="label" style="margin-bottom:4px" data-i18n="ask_up">Ask Up</div>
             <div class="metric mono" id="hero-ask-up">-</div>
           </div>
           <div style="font-size:28px; font-weight:700; color:var(--muted)">+</div>
           <div>
-            <div class="label" style="margin-bottom:4px">Ask Down</div>
+            <div class="label" style="margin-bottom:4px" data-i18n="ask_down">Ask Down</div>
             <div class="metric mono" id="hero-ask-down">-</div>
           </div>
           <div style="font-size:28px; font-weight:700; color:var(--muted)">=</div>
           <div>
-            <div class="label" style="margin-bottom:4px">Sum</div>
+            <div class="label" style="margin-bottom:4px" data-i18n="sum">Sum</div>
             <div class="metric mono" id="hero-sum" style="font-size:32px">-</div>
           </div>
         </div>
@@ -186,7 +205,7 @@
         </div>
       </section>
       <section class="panel">
-        <div class="label">Risk</div>
+        <div class="label" data-i18n="risk">Risk</div>
         <div class="metric" id="risk-status">allowed</div>
         <div class="metric-sub" id="risk-meta">losses: 0 | open orders: 0</div>
       </section>
@@ -194,16 +213,27 @@
 
     <div class="hero">
       <section class="panel">
-        <div class="label">Recent Trades</div>
+        <div class="label" data-i18n="recent_trades">Recent Trades</div>
         <table>
-          <thead><tr><th>Time</th><th>Market</th><th>Status</th><th>Qty</th><th>Profit</th></tr></thead>
+          <thead><tr>
+            <th data-i18n="th_time">Time</th>
+            <th data-i18n="th_market">Market</th>
+            <th data-i18n="th_status">Status</th>
+            <th data-i18n="th_qty">Qty</th>
+            <th data-i18n="th_profit">Profit</th>
+          </tr></thead>
           <tbody id="trades-body"></tbody>
         </table>
       </section>
       <section class="panel">
-        <div class="label">Opportunities</div>
+        <div class="label" data-i18n="opportunities">Opportunities</div>
         <table>
-          <thead><tr><th>Time</th><th>Condition</th><th>Edge</th><th>Exec</th></tr></thead>
+          <thead><tr>
+            <th data-i18n="th_time">Time</th>
+            <th data-i18n="th_condition">Condition</th>
+            <th data-i18n="th_edge">Edge</th>
+            <th data-i18n="th_exec">Exec</th>
+          </tr></thead>
           <tbody id="opps-body"></tbody>
         </table>
       </section>
@@ -211,6 +241,89 @@
   </div>
 
   <script>
+    // ─── i18n ───────────────────────────────────────────────────────────
+    const I18N = {
+      en: {
+        tracked_markets: 'Tracked Markets',
+        tracked_books: 'Tracked Books',
+        today_pnl: 'Today PnL',
+        lifetime_profit: 'Lifetime Profit',
+        live_orderbook: 'Live Orderbook',
+        ask_up: 'Ask Up',
+        ask_down: 'Ask Down',
+        sum: 'Sum',
+        risk: 'Risk',
+        recent_trades: 'Recent Trades',
+        opportunities: 'Opportunities',
+        th_time: 'Time',
+        th_market: 'Market',
+        th_status: 'Status',
+        th_qty: 'Qty',
+        th_profit: 'Profit',
+        th_condition: 'Condition',
+        th_edge: 'Edge',
+        th_exec: 'Exec',
+        profit: 'profit',
+        market: 'market',
+        expiry: 'expiry',
+        allowed: 'allowed',
+        blocked: 'blocked',
+        losses: 'losses',
+        open_orders: 'open orders',
+        yes: 'yes',
+        no: 'no',
+      },
+      zh: {
+        tracked_markets: '跟踪市场',
+        tracked_books: '订单簿',
+        today_pnl: '今日盈亏',
+        lifetime_profit: '累计利润',
+        live_orderbook: '实时盘口',
+        ask_up: '看涨卖价',
+        ask_down: '看跌卖价',
+        sum: '总和',
+        risk: '风控',
+        recent_trades: '最近交易',
+        opportunities: '套利机会',
+        th_time: '时间',
+        th_market: '市场',
+        th_status: '状态',
+        th_qty: '数量',
+        th_profit: '盈亏',
+        th_condition: '合约',
+        th_edge: '利差',
+        th_exec: '执行',
+        profit: '利润',
+        market: '市场',
+        expiry: '到期',
+        allowed: '允许',
+        blocked: '已阻止',
+        losses: '亏损次数',
+        open_orders: '挂单数',
+        yes: '是',
+        no: '否',
+      },
+    };
+
+    let currentLang = localStorage.getItem('poly-arb-lang') || 'en';
+
+    function t(key) { return (I18N[currentLang] || I18N.en)[key] || key; }
+
+    function applyI18n() {
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        el.textContent = t(el.dataset.i18n);
+      });
+      document.getElementById('lang-toggle').textContent = currentLang === 'en' ? '中文' : 'EN';
+    }
+
+    function toggleLang() {
+      currentLang = currentLang === 'en' ? 'zh' : 'en';
+      localStorage.setItem('poly-arb-lang', currentLang);
+      applyI18n();
+      loadStatus().catch(console.error);
+    }
+
+    // ─── Utils ──────────────────────────────────────────────────────────
     const fmtUsd = (n) => {
       const value = Number(n || 0);
       return `${value >= 0 ? '+' : ''}$${value.toFixed(4)}`;
@@ -225,6 +338,7 @@
       return res.json();
     }
 
+    // ─── Status ─────────────────────────────────────────────────────────
     async function loadStatus() {
       const status = await fetchJson('/api/status');
       setText('bot-status', status.bot_status.state || 'watching');
@@ -232,10 +346,11 @@
       setText('tracked-books', status.tracked_books);
       setText('today-profit', fmtUsd(status.today.total_profit));
       setText('lifetime-profit', fmtUsd(status.lifetime.total_profit));
-      setText('risk-status', status.risk.is_trading_allowed ? 'allowed' : 'blocked');
-      setText('risk-meta', `losses: ${status.risk.consecutive_losses} | open orders: ${status.risk.open_orders}`);
+      setText('risk-status', status.risk.is_trading_allowed ? t('allowed') : t('blocked'));
+      setText('risk-meta', `${t('losses')}: ${status.risk.consecutive_losses} | ${t('open_orders')}: ${status.risk.open_orders}`);
     }
 
+    // ─── Tables ─────────────────────────────────────────────────────────
     async function loadTables() {
       const [trades, opps] = await Promise.all([
         fetchJson('/api/trades?limit=8'),
@@ -255,11 +370,12 @@
           <td>${opp.created_at || '-'}</td>
           <td class="mono">${(opp.condition_id || '').slice(0, 10)}</td>
           <td class="${opp.net_profit >= 0 ? 'good' : 'bad'}">${fmtUsd(opp.net_profit)}</td>
-          <td>${opp.executed ? 'yes' : 'no'}</td>
+          <td>${opp.executed ? t('yes') : t('no')}</td>
         </tr>
       `).join('');
     }
 
+    // ─── WebSocket ──────────────────────────────────────────────────────
     function connectWs() {
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${protocol}//${location.host}/ws/live`);
@@ -277,16 +393,18 @@
             sumEl.textContent = '-';
             sumEl.className = 'metric mono';
           }
-          setText('hero-profit', `profit: ${data.net_profit_potential != null ? fmtUsd(data.net_profit_potential) : '-'}`);
-          setText('hero-condition', `market: ${data.condition_id ? data.condition_id.slice(0, 12) + '...' : '-'}`);
+          setText('hero-profit', `${t('profit')}: ${data.net_profit_potential != null ? fmtUsd(data.net_profit_potential) : '-'}`);
+          setText('hero-condition', `${t('market')}: ${data.condition_id ? data.condition_id.slice(0, 12) + '...' : '-'}`);
           const ttl = data.time_to_expiry_sec;
-          setText('hero-expiry', `expiry: ${ttl != null ? (ttl > 60 ? Math.floor(ttl/60) + 'm' + (ttl%60) + 's' : ttl + 's') : '-'}`);
+          setText('hero-expiry', `${t('expiry')}: ${ttl != null ? (ttl > 60 ? Math.floor(ttl/60) + 'm' + (ttl%60) + 's' : ttl + 's') : '-'}`);
           setText('bot-status', data.bot_status || 'watching');
         }
       };
       ws.onclose = () => setTimeout(connectWs, 1500);
     }
 
+    // ─── Init ───────────────────────────────────────────────────────────
+    applyI18n();
     loadStatus().catch(console.error);
     loadTables().catch(console.error);
     connectWs();
