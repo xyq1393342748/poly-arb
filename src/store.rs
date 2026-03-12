@@ -83,7 +83,7 @@ impl Store {
         let url = if db_path == ":memory:" || db_path.starts_with("sqlite:") {
             db_path.to_owned()
         } else {
-            format!("sqlite://{db_path}")
+            format!("sqlite://{db_path}?mode=rwc")
         };
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -251,8 +251,8 @@ impl Store {
                 SUM(CASE WHEN status = 'BOTH_FILLED' THEN 1 ELSE 0 END) AS wins,
                 SUM(CASE WHEN status = 'ONE_SIDE' THEN 1 ELSE 0 END) AS losses,
                 SUM(CASE WHEN status = 'BOTH_CANCELLED' THEN 1 ELSE 0 END) AS cancelled,
-                COALESCE(SUM(net_profit), 0) AS total_profit,
-                COALESCE(SUM(total_cost * quantity), 0) AS total_volume
+                CAST(COALESCE(SUM(net_profit), 0) AS REAL) AS total_profit,
+                CAST(COALESCE(SUM(total_cost * quantity), 0) AS REAL) AS total_volume
              FROM arb_trades",
         )
         .fetch_one(&self.pool)

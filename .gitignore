@@ -7,3 +7,4 @@ config.toml
 .env
 *.pem
 *.key
+*.log

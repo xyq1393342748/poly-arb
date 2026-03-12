@@ -220,13 +220,38 @@ async fn main() -> Result<()> {
             }
             _ = ticker.tick() => {
                 let bot_status = state.bot_status.read().await.clone();
+                // 直接从 orderbook 读取当前 best ask，不依赖套利信号
+                let markets = state.current_markets.read().await.clone();
+                let (ask_up, ask_down, sum, condition_id, time_to_expiry_sec) = if let Some(market) = markets.first() {
+                    let pair = books.get_pair_asks(&market.token_id_up, &market.token_id_down);
+                    let (up_price, down_price) = match pair {
+                        Some((up, _, down, _)) => (Some(up), Some(down)),
+                        None => (
+                            books.get_book(&market.token_id_up).and_then(|b| b.best_ask()).map(|(p, _)| p),
+                            books.get_book(&market.token_id_down).and_then(|b| b.best_ask()).map(|(p, _)| p),
+                        ),
+                    };
+                    let s = match (up_price, down_price) {
+                        (Some(u), Some(d)) => Some(u + d),
+                        _ => None,
+                    };
+                    let ttl = (market.end_date - Utc::now()).num_seconds();
+                    (up_price, down_price, s, Some(market.condition_id.clone()), Some(ttl))
+                } else {
+                    (None, None, None, None, None)
+                };
+                let net_profit = match sum {
+                    Some(s) if s < 1.0 => Some(1.0 - s - config.strategy.taker_fee_rate * 2.0),
+                    Some(s) => Some(1.0 - s),
+                    None => None,
+                };
                 let ticker_message = TickerMessage {
-                    ask_up: latest_signal.as_ref().map(|signal| signal.ask_up),
-                    ask_down: latest_signal.as_ref().map(|signal| signal.ask_down),
-                    sum: latest_signal.as_ref().map(|signal| signal.total_cost),
-                    net_profit_potential: latest_signal.as_ref().map(|signal| signal.net_profit),
-                    condition_id: latest_signal.as_ref().map(|signal| signal.condition_id.clone()),
-                    time_to_expiry_sec: latest_signal.as_ref().map(|signal| signal.time_to_expiry_sec),
+                    ask_up,
+                    ask_down,
+                    sum,
+                    net_profit_potential: net_profit,
+                    condition_id,
+                    time_to_expiry_sec,
                     bot_status: bot_status.label().to_owned(),
                 };
                 broadcast_live(&live_tx, LiveMessage::Ticker(ticker_message));

@@ -162,11 +162,26 @@
 
     <div class="hero">
       <section class="panel">
-        <div class="label">Live Edge</div>
-        <div class="hero-value" id="hero-profit">-</div>
+        <div class="label">Live Orderbook</div>
+        <div style="display:flex; gap:24px; align-items:baseline; margin-bottom:14px;">
+          <div>
+            <div class="label" style="margin-bottom:4px">Ask Up</div>
+            <div class="metric mono" id="hero-ask-up">-</div>
+          </div>
+          <div style="font-size:28px; font-weight:700; color:var(--muted)">+</div>
+          <div>
+            <div class="label" style="margin-bottom:4px">Ask Down</div>
+            <div class="metric mono" id="hero-ask-down">-</div>
+          </div>
+          <div style="font-size:28px; font-weight:700; color:var(--muted)">=</div>
+          <div>
+            <div class="label" style="margin-bottom:4px">Sum</div>
+            <div class="metric mono" id="hero-sum" style="font-size:32px">-</div>
+          </div>
+        </div>
         <div class="hero-row mono">
-          <div id="hero-condition">condition: -</div>
-          <div id="hero-sum">sum: -</div>
+          <div id="hero-profit">profit: -</div>
+          <div id="hero-condition">market: -</div>
           <div id="hero-expiry">expiry: -</div>
         </div>
       </section>
@@ -252,10 +267,20 @@
         const payload = JSON.parse(event.data);
         if (payload.type === 'Ticker') {
           const data = payload.data;
-          setText('hero-profit', data.net_profit_potential == null ? '-' : fmtUsd(data.net_profit_potential));
-          setText('hero-condition', `condition: ${data.condition_id || '-'}`);
-          setText('hero-sum', `sum: ${data.sum == null ? '-' : data.sum.toFixed(4)}`);
-          setText('hero-expiry', `expiry: ${data.time_to_expiry_sec == null ? '-' : `${data.time_to_expiry_sec}s`}`);
+          setText('hero-ask-up', data.ask_up != null ? data.ask_up.toFixed(4) : '-');
+          setText('hero-ask-down', data.ask_down != null ? data.ask_down.toFixed(4) : '-');
+          const sumEl = document.getElementById('hero-sum');
+          if (sumEl && data.sum != null) {
+            sumEl.textContent = data.sum.toFixed(4);
+            sumEl.className = 'metric mono ' + (data.sum < 1 ? 'good' : data.sum < 1.01 ? 'warn' : 'bad');
+          } else if (sumEl) {
+            sumEl.textContent = '-';
+            sumEl.className = 'metric mono';
+          }
+          setText('hero-profit', `profit: ${data.net_profit_potential != null ? fmtUsd(data.net_profit_potential) : '-'}`);
+          setText('hero-condition', `market: ${data.condition_id ? data.condition_id.slice(0, 12) + '...' : '-'}`);
+          const ttl = data.time_to_expiry_sec;
+          setText('hero-expiry', `expiry: ${ttl != null ? (ttl > 60 ? Math.floor(ttl/60) + 'm' + (ttl%60) + 's' : ttl + 's') : '-'}`);
           setText('bot-status', data.bot_status || 'watching');
         }
       };

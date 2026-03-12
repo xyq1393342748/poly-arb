@@ -36,7 +36,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/", get(index))
         .route("/api/status", get(get_status))
         .route("/api/trades", get(get_trades))
-        .route("/api/trades/:id", get(get_trade_detail))
+        .route("/api/trades/{id}", get(get_trade_detail))
         .route("/api/stats/today", get(get_today_stats))
         .route("/api/stats/daily", get(get_daily_stats))
         .route("/api/stats/lifetime", get(get_lifetime_stats))

@@ -8,12 +8,14 @@ use tokio::{
     sync::mpsc,
     time::{sleep, Duration},
 };
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MarketInfo {
     pub condition_id: String,
+    pub slug: String,
     pub question: String,
     pub token_id_up: String,
     pub token_id_down: String,
@@ -33,6 +35,47 @@ pub enum MarketEvent {
     MarketExpiring(String),
 }
 
+/// 根据当前时间推算即将到来的市场 slug
+/// 格式: {asset}-updown-{horizon}m-{startEpoch}
+/// startEpoch = floor(now / interval) * interval (市场开始时间)
+/// endTime = startEpoch + interval (市场结束时间)
+struct SlugCandidate {
+    slug: String,
+    end_epoch: i64,
+    minutes_left: f64,
+}
+
+fn generate_upcoming_slugs(asset: &str, duration: &str) -> Vec<SlugCandidate> {
+    let horizon_sec: i64 = match duration.to_lowercase().as_str() {
+        "5m" | "5min" => 300,
+        "15m" | "15min" => 900,
+        "1h" | "60m" => 3600,
+        _ => 300,
+    };
+    let horizon_min = horizon_sec / 60;
+    let now_sec = Utc::now().timestamp();
+    let sym = asset.to_lowercase();
+
+    let current_start = (now_sec / horizon_sec) * horizon_sec;
+    let mut results = Vec::new();
+
+    // 当前周期 + 下一个周期
+    for &start_epoch in &[current_start, current_start + horizon_sec] {
+        let end_epoch = start_epoch + horizon_sec;
+        let minutes_left = (end_epoch - now_sec) as f64 / 60.0;
+        // 跳过快过期的(<18秒)和太远的(>horizon+3分钟)
+        if minutes_left < 0.3 || minutes_left > (horizon_min as f64 + 3.0) {
+            continue;
+        }
+        results.push(SlugCandidate {
+            slug: format!("{}-updown-{}m-{}", sym, horizon_min, start_epoch),
+            end_epoch,
+            minutes_left,
+        });
+    }
+    results
+}
+
 impl MarketDiscovery {
     pub fn new(config: &Config) -> Self {
         Self {
@@ -41,31 +84,88 @@ impl MarketDiscovery {
         }
     }
 
-    pub async fn fetch_active_markets(&self) -> Result<Vec<MarketInfo>> {
-        let asset_tag = self.config.market.asset.to_lowercase();
+    /// 用推算出的 slug 精确查询 Gamma API，拿到 condition_id 和 token_id
+    async fn fetch_market_by_slug(&self, slug: &str) -> Result<Option<MarketInfo>> {
         let url = format!(
             "{}/markets",
             self.config.api.gamma_rest_url.trim_end_matches('/')
         );
         let response = self
             .client
-            .get(url)
-            .query(&[
-                ("limit", "200"),
-                ("closed", "false"),
-                ("active", "true"),
-                ("tag", asset_tag.as_str()),
-            ])
+            .get(&url)
+            .query(&[("slug", slug)])
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?
             .error_for_status()?;
         let body = response.text().await?;
         let raw_markets = parse_market_response(&body)?;
-        Ok(filter_active_markets(
-            &raw_markets,
+        let market = match raw_markets.into_iter().next() {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let condition_id = match market.condition_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let question = market.question.unwrap_or_default();
+        let token_ids = match market.clob_token_ids {
+            Some(f) => f.into_vec(),
+            None => return Ok(None),
+        };
+        let outcomes = match market.outcomes {
+            Some(f) => f.into_vec(),
+            None => return Ok(None),
+        };
+        if token_ids.len() != 2 || outcomes.len() != 2 {
+            return Ok(None);
+        }
+        let end_date = market
+            .end_date
+            .as_ref()
+            .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let (token_id_up, token_id_down) = match ordered_token_pair(&outcomes, &token_ids) {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        Ok(Some(MarketInfo {
+            condition_id,
+            slug: slug.to_string(),
+            question,
+            token_id_up,
+            token_id_down,
+            end_date,
+            min_tick_size: market.min_tick_size.unwrap_or(0.01),
+        }))
+    }
+
+    /// 推算当前和下一个周期的 slug，查询返回活跃市场
+    pub async fn fetch_active_markets(&self) -> Result<Vec<MarketInfo>> {
+        let slugs = generate_upcoming_slugs(
             &self.config.market.asset,
             &self.config.market.duration,
-        ))
+        );
+        let mut markets = Vec::new();
+        for candidate in &slugs {
+            debug!("尝试 slug: {} (剩余 {:.1} 分钟)", candidate.slug, candidate.minutes_left);
+            match self.fetch_market_by_slug(&candidate.slug).await {
+                Ok(Some(market)) => {
+                    info!("发现市场: {} → {}", candidate.slug, market.condition_id);
+                    markets.push(market);
+                }
+                Ok(None) => {
+                    debug!("slug {} 未找到市场（可能尚未创建）", candidate.slug);
+                }
+                Err(e) => {
+                    warn!("查询 slug {} 失败: {}", candidate.slug, e);
+                }
+            }
+        }
+        Ok(markets)
     }
 
     pub async fn run(&self, tx: mpsc::Sender<MarketEvent>) -> Result<()> {
@@ -76,6 +176,7 @@ impl MarketDiscovery {
             for market in markets {
                 current.insert(market.condition_id.clone(), market.clone());
                 if !known.contains_key(&market.condition_id) {
+                    info!("新市场: {} [{}]", market.slug, market.condition_id);
                     tx.send(MarketEvent::NewMarket(market.clone())).await?;
                 }
                 if (market.end_date - Utc::now()).num_seconds() <= 30 {
@@ -96,6 +197,8 @@ impl MarketDiscovery {
         }
     }
 }
+
+// ─── Gamma API 响应解析（保留，slug 查询也用同样的格式）──────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 struct GammaMarket {
@@ -142,60 +245,6 @@ fn parse_market_response(body: &str) -> Result<Vec<GammaMarket>> {
     })
 }
 
-pub fn filter_active_markets(
-    raw_markets: &[GammaMarket],
-    asset: &str,
-    duration: &str,
-) -> Vec<MarketInfo> {
-    raw_markets
-        .iter()
-        .filter_map(|market| {
-            let question = market.question.clone()?;
-            if !is_target_market(&question, asset, duration) {
-                return None;
-            }
-            let condition_id = market.condition_id.clone()?;
-            let token_ids = market.clob_token_ids.clone()?.into_vec();
-            let outcomes = market.outcomes.clone()?.into_vec();
-            if token_ids.len() != 2 || outcomes.len() != 2 {
-                return None;
-            }
-            let end_date = market
-                .end_date
-                .as_ref()
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
-                .with_timezone(&Utc);
-            let (token_id_up, token_id_down) = ordered_token_pair(&outcomes, &token_ids)?;
-            Some(MarketInfo {
-                condition_id,
-                question,
-                token_id_up,
-                token_id_down,
-                end_date,
-                min_tick_size: market.min_tick_size.unwrap_or(0.01),
-            })
-        })
-        .collect()
-}
-
-fn is_target_market(question: &str, asset: &str, duration: &str) -> bool {
-    let q = question.to_lowercase();
-    let asset_match = q.contains(&asset.to_lowercase());
-    let up_down_match = q.contains("up or down")
-        || (q.contains("up") && q.contains("down"))
-        || (q.contains("above") && q.contains("below"));
-    let duration_match = match duration.to_lowercase().as_str() {
-        "5m" | "5min" | "5 minute" | "5 minutes" => {
-            q.contains("5 minute") || q.contains("5 min") || q.contains("5m")
-        }
-        "15m" | "15min" | "15 minute" | "15 minutes" => {
-            q.contains("15 minute") || q.contains("15 min") || q.contains("15m")
-        }
-        other => q.contains(other),
-    };
-    asset_match && up_down_match && duration_match
-}
-
 fn ordered_token_pair(outcomes: &[String], token_ids: &[String]) -> Option<(String, String)> {
     let mut pairs: Vec<(String, String)> = outcomes
         .iter()
@@ -215,5 +264,45 @@ fn outcome_priority(outcome: &str) -> u8 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slug_generation() {
+        let slugs = generate_upcoming_slugs("BTC", "5m");
+        assert!(!slugs.is_empty(), "应该至少生成一个 slug");
+        for s in &slugs {
+            assert!(s.slug.starts_with("btc-updown-5m-"), "slug 格式错误: {}", s.slug);
+            assert!(s.minutes_left > 0.0, "剩余时间应 > 0");
+            // startEpoch 应该是 300 的整数倍
+            let epoch_str = s.slug.strip_prefix("btc-updown-5m-").unwrap();
+            let epoch: i64 = epoch_str.parse().unwrap();
+            assert_eq!(epoch % 300, 0, "epoch 应该是 300 的整数倍");
+        }
+    }
+
+    #[test]
+    fn test_slug_generation_15m() {
+        let slugs = generate_upcoming_slugs("ETH", "15m");
+        assert!(!slugs.is_empty());
+        for s in &slugs {
+            assert!(s.slug.starts_with("eth-updown-15m-"));
+            let epoch_str = s.slug.strip_prefix("eth-updown-15m-").unwrap();
+            let epoch: i64 = epoch_str.parse().unwrap();
+            assert_eq!(epoch % 900, 0, "epoch 应该是 900 的整数倍");
+        }
+    }
+
+    #[test]
+    fn test_ordered_token_pair() {
+        let outcomes = vec!["Down".to_string(), "Up".to_string()];
+        let tokens = vec!["token_down".to_string(), "token_up".to_string()];
+        let (up, down) = ordered_token_pair(&outcomes, &tokens).unwrap();
+        assert_eq!(up, "token_up");
+        assert_eq!(down, "token_down");
     }
 }
