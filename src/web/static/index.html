@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Poly Arb Dashboard</title>
+  <style>
+    :root {
+      --bg: #07111f;
+      --panel: rgba(12, 27, 44, 0.82);
+      --panel-strong: rgba(17, 39, 64, 0.95);
+      --text: #e6f1ff;
+      --muted: #8ca6c2;
+      --line: rgba(255,255,255,0.08);
+      --good: #4fe0a5;
+      --warn: #f0c36d;
+      --bad: #ff7b7b;
+      --accent: #6bd3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(107, 211, 255, 0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(79, 224, 165, 0.12), transparent 28%),
+        linear-gradient(180deg, #06101d 0%, #09192b 54%, #06101b 100%);
+      min-height: 100vh;
+    }
+    .shell {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .title {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .status-pill {
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 14px 40px rgba(0,0,0,0.22);
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .label {
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+    .metric {
+      font-size: 28px;
+      font-weight: 700;
+    }
+    .metric-sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .hero-value {
+      font-size: 48px;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 14px;
+    }
+    .hero-row {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      color: var(--muted);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+    }
+    th {
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 11px;
+    }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .mono { font-family: "IBM Plex Mono", monospace; }
+    @media (max-width: 980px) {
+      .grid, .hero { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 720px) {
+      .grid, .hero { grid-template-columns: 1fr; }
+      .hero-value { font-size: 36px; }
+      .shell { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="title">Poly Arb</div>
+      <div class="status-pill" id="bot-status">starting</div>
+    </div>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="label">Tracked Markets</div>
+        <div class="metric" id="tracked-markets">0</div>
+      </section>
+      <section class="panel">
+        <div class="label">Tracked Books</div>
+        <div class="metric" id="tracked-books">0</div>
+      </section>
+      <section class="panel">
+        <div class="label">Today PnL</div>
+        <div class="metric" id="today-profit">$0.00</div>
+      </section>
+      <section class="panel">
+        <div class="label">Lifetime Profit</div>
+        <div class="metric" id="lifetime-profit">$0.00</div>
+      </section>
+    </div>
+
+    <div class="hero">
+      <section class="panel">
+        <div class="label">Live Edge</div>
+        <div class="hero-value" id="hero-profit">-</div>
+        <div class="hero-row mono">
+          <div id="hero-condition">condition: -</div>
+          <div id="hero-sum">sum: -</div>
+          <div id="hero-expiry">expiry: -</div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="label">Risk</div>
+        <div class="metric" id="risk-status">allowed</div>
+        <div class="metric-sub" id="risk-meta">losses: 0 | open orders: 0</div>
+      </section>
+    </div>
+
+    <div class="hero">
+      <section class="panel">
+        <div class="label">Recent Trades</div>
+        <table>
+          <thead><tr><th>Time</th><th>Market</th><th>Status</th><th>Qty</th><th>Profit</th></tr></thead>
+          <tbody id="trades-body"></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <div class="label">Opportunities</div>
+        <table>
+          <thead><tr><th>Time</th><th>Condition</th><th>Edge</th><th>Exec</th></tr></thead>
+          <tbody id="opps-body"></tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const fmtUsd = (n) => {
+      const value = Number(n || 0);
+      return `${value >= 0 ? '+' : ''}$${value.toFixed(4)}`;
+    };
+    const setText = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    };
+
+    async function fetchJson(path) {
+      const res = await fetch(path);
+      return res.json();
+    }
+
+    async function loadStatus() {
+      const status = await fetchJson('/api/status');
+      setText('bot-status', status.bot_status.state || 'watching');
+      setText('tracked-markets', status.tracked_markets);
+      setText('tracked-books', status.tracked_books);
+      setText('today-profit', fmtUsd(status.today.total_profit));
+      setText('lifetime-profit', fmtUsd(status.lifetime.total_profit));
+      setText('risk-status', status.risk.is_trading_allowed ? 'allowed' : 'blocked');
+      setText('risk-meta', `losses: ${status.risk.consecutive_losses} | open orders: ${status.risk.open_orders}`);
+    }
+
+    async function loadTables() {
+      const [trades, opps] = await Promise.all([
+        fetchJson('/api/trades?limit=8'),
+        fetchJson('/api/opportunities?limit=8'),
+      ]);
+      document.getElementById('trades-body').innerHTML = trades.map((trade) => `
+        <tr>
+          <td>${trade.created_at || '-'}</td>
+          <td class="mono">${(trade.condition_id || '').slice(0, 10)}</td>
+          <td>${trade.status}</td>
+          <td>${trade.quantity}</td>
+          <td class="${(trade.net_profit || 0) >= 0 ? 'good' : 'bad'}">${fmtUsd(trade.net_profit || 0)}</td>
+        </tr>
+      `).join('');
+      document.getElementById('opps-body').innerHTML = opps.map((opp) => `
+        <tr>
+          <td>${opp.created_at || '-'}</td>
+          <td class="mono">${(opp.condition_id || '').slice(0, 10)}</td>
+          <td class="${opp.net_profit >= 0 ? 'good' : 'bad'}">${fmtUsd(opp.net_profit)}</td>
+          <td>${opp.executed ? 'yes' : 'no'}</td>
+        </tr>
+      `).join('');
+    }
+
+    function connectWs() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${location.host}/ws/live`);
+      ws.onmessage = (event) => {
+        const payload = JSON.parse(event.data);
+        if (payload.type === 'Ticker') {
+          const data = payload.data;
+          setText('hero-profit', data.net_profit_potential == null ? '-' : fmtUsd(data.net_profit_potential));
+          setText('hero-condition', `condition: ${data.condition_id || '-'}`);
+          setText('hero-sum', `sum: ${data.sum == null ? '-' : data.sum.toFixed(4)}`);
+          setText('hero-expiry', `expiry: ${data.time_to_expiry_sec == null ? '-' : `${data.time_to_expiry_sec}s`}`);
+          setText('bot-status', data.bot_status || 'watching');
+        }
+      };
+      ws.onclose = () => setTimeout(connectWs, 1500);
+    }
+
+    loadStatus().catch(console.error);
+    loadTables().catch(console.error);
+    connectWs();
+    setInterval(() => loadStatus().catch(console.error), 5000);
+    setInterval(() => loadTables().catch(console.error), 10000);
+  </script>
+</body>
+</html>

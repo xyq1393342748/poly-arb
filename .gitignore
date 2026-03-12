@@ -1,0 +1,9 @@
+/target
+/data
+*.db
+*.db-shm
+*.db-wal
+config.toml
+.env
+*.pem
+*.key

@@ -1,0 +1,58 @@
+[api]
+clob_rest_url = "https://clob.polymarket.com"
+clob_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+clob_user_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+gamma_rest_url = "https://gamma-api.polymarket.com"
+api_key = ""
+api_secret = ""
+passphrase = ""
+
+[wallet]
+private_key = ""
+chain_id = 137
+
+[market]
+asset = "BTC"
+duration = "5m"
+poll_interval_sec = 30
+
+[strategy]
+min_profit = 0.005
+max_position_usd = 50.0
+taker_fee_rate = 0.001
+gas_per_order = 0.007
+
+[risk]
+max_daily_loss = 20.0
+max_open_orders = 4
+cooldown_after_loss_sec = 60
+max_one_side_per_day = 5
+max_one_side_consecutive = 2
+one_side_cooldown_sec = 900
+min_profit_rate = 0.01
+recovery_retry_timeout_ms = 500
+sell_max_retries = 3
+sell_price_step = 0.01
+min_time_to_expiry_sec = 30
+
+[optimization]
+use_batch_orders = true
+presign_enabled = true
+presign_price_offsets = 3
+presign_ttl_sec = 30
+ws_redundant_connections = 2
+http2_enabled = true
+connection_pool_size = 4
+tcp_nodelay = true
+
+[mode]
+dry_run = true
+log_level = "info"
+
+[web]
+enabled = true
+bind = "0.0.0.0:3721"
+ws_push_interval_ms = 500
+
+[store]
+db_path = "data/poly_arb.db"
