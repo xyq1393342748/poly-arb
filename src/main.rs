@@ -1,19 +1,21 @@
-use std::{cmp::Ordering, collections::HashMap, env, path::Path, sync::Arc};
+use std::{collections::HashMap, env, path::Path, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use chrono::Utc;
 use tokio::{
     select,
     sync::{broadcast, mpsc},
+    time::Duration,
 };
 
 use poly_arb::{
     arb_engine::{ArbEngine, ArbSignal, MarketPair},
     auth::{ApiAuth, OrderSigner},
     config::Config,
+    fees,
     logger::{init_tracing, Logger},
     market_discovery::{MarketDiscovery, MarketEvent, MarketInfo},
-    merger::Merger,
+    merger::{MergeResult, Merger},
     order_manager::{ArbExecution, ArbStatus, OrderManager},
     orderbook::OrderBookManager,
     risk::{RiskManager, RiskVeto},
@@ -28,6 +30,11 @@ use poly_arb::{
     ws_market::MarketWsClient,
     ws_user::UserWsClient,
 };
+
+struct ExecResult {
+    signal: ArbSignal,
+    execution: ArbExecution,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,16 +85,41 @@ async fn main() -> Result<()> {
     let market_ws = MarketWsClient::new(&config, &auth);
     let user_ws = UserWsClient::new(&config, &auth);
     let order_manager = OrderManager::new(&config, auth.clone(), signer.clone());
-    let merger = Merger::new(&config);
+    let merger = Arc::new(Merger::new(&config));
+
+    // Startup: check and set CTF approval for merge
+    if config.merge.enabled && !config.mode.dry_run {
+        if let Some(signer_ref) = &signer {
+            let owner = signer_ref.address;
+            let ctf = alloy_primitives::Address::from_str("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+                .expect("invalid CTF address");
+            match merger.check_approval(owner, ctf).await {
+                Ok(true) => tracing::info!("CTF approval already set"),
+                Ok(false) => {
+                    tracing::info!("Setting CTF approval for merge...");
+                    match merger.ensure_approval(ctf).await {
+                        Ok(tx) => tracing::info!(tx_hash = tx, "CTF approval set"),
+                        Err(e) => tracing::warn!(error = %e, "failed to set CTF approval, merge may fail"),
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to check CTF approval"),
+            }
+        }
+    }
+
     let mut risk = RiskManager::new(&config.risk);
     let mut books = OrderBookManager::default();
     let mut engine = ArbEngine::new(config.strategy.clone());
-    let mut latest_signal: Option<ArbSignal> = None;
     let mut last_triggered: HashMap<String, i64> = HashMap::new();
+    let mut executing = false;
+    let mut market_pairs_buf: Vec<MarketPair> = Vec::new();
+    let mut cached_signal: Option<ArbSignal> = None;
 
     let (market_tx, mut market_rx) = mpsc::channel(128);
     let (book_tx, mut book_rx) = mpsc::channel(2048);
     let (user_tx, mut user_rx) = mpsc::channel(1024);
+    let (merge_done_tx, mut merge_done_rx) = mpsc::channel::<(i64, MergeResult)>(16);
+    let (exec_done_tx, mut exec_done_rx) = mpsc::channel::<ExecResult>(4);
 
     tokio::spawn({
         let discovery = discovery.clone();
@@ -108,9 +140,8 @@ async fn main() -> Result<()> {
     }
 
     *state.bot_status.write().await = BotStatus::Watching;
-    let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(
-        config.web.ws_push_interval_ms,
-    ));
+    let mut ticker = tokio::time::interval(Duration::from_millis(config.web.ws_push_interval_ms));
+    let mut presign_ticker = tokio::time::interval(Duration::from_secs(3));
 
     loop {
         select! {
@@ -128,22 +159,25 @@ async fn main() -> Result<()> {
                 }
             }
             Some(update) = book_rx.recv() => {
+                // Drain: process all pending book updates at once
                 books.process_update(update);
-                *state.current_books.write().await = books.clone();
-                let market_pairs = engine.markets().cloned().collect::<Vec<_>>();
-                let _ = order_manager.refresh_presigned_orders(&books, &market_pairs).await;
-                let best_signal = engine
-                    .evaluate(&books)
-                    .into_iter()
-                    .max_by(|a, b| a.net_profit.partial_cmp(&b.net_profit).unwrap_or(Ordering::Equal));
-                *state.current_signal.write().await = best_signal.clone();
-                latest_signal = best_signal.clone();
+                while let Ok(queued) = book_rx.try_recv() {
+                    books.process_update(queued);
+                }
+
+                // Skip evaluation while an execution is in flight
+                if executing {
+                    continue;
+                }
+
+                let best_signal = engine.evaluate_best(&books);
+                cached_signal = best_signal.clone();
 
                 if let Some(signal) = best_signal {
                     let now_ms = Utc::now().timestamp_millis();
                     let is_duplicate = last_triggered
                         .get(&signal.condition_id)
-                        .map(|last| now_ms - *last < 2_000)
+                        .map(|last| now_ms - *last < 500)
                         .unwrap_or(false);
                     if is_duplicate {
                         continue;
@@ -153,6 +187,7 @@ async fn main() -> Result<()> {
                     match risk.check_pre_trade(&signal) {
                         RiskVeto::Approved => {
                             last_triggered.insert(signal.condition_id.clone(), now_ms);
+                            executing = true;
                             *state.bot_status.write().await = BotStatus::Executing;
                             let opportunity = OpportunityRecord {
                                 id: 0,
@@ -173,57 +208,31 @@ async fn main() -> Result<()> {
                                 expected_profit: signal.net_profit * signal.max_quantity,
                             }));
 
-                            let mut execution = order_manager.execute_arb(signal.clone(), Some(&books)).await?;
-                            if matches!(execution.status, ArbStatus::OneSideFilled { .. }) {
-                                order_manager
-                                    .handle_one_side_fill(&mut execution, &books)
-                                    .await?;
-                            }
-                            // MERGE: 如果双边成交且启用了 merge，立即合并回收 USDC
-                            if config.merge.enabled {
-                                if let ArbStatus::BothFilled { profit } = &execution.status {
-                                    let merge_profit = *profit;
-                                    match merger.merge_positions(&signal.condition_id, execution.signal.max_quantity).await {
-                                        Ok(result) if result.success => {
-                                            execution.status = ArbStatus::Merged {
-                                                profit: merge_profit,
-                                                tx_hash: result.tx_hash.unwrap_or_default(),
-                                            };
-                                        }
-                                        Ok(result) => {
-                                            execution.status = ArbStatus::MergeFailed {
-                                                profit: merge_profit,
-                                                reason: result.error.unwrap_or_else(|| "unknown".to_owned()),
-                                            };
-                                        }
-                                        Err(e) => {
-                                            execution.status = ArbStatus::MergeFailed {
-                                                profit: merge_profit,
-                                                reason: e.to_string(),
-                                            };
-                                        }
+                            // Async execution: spawn order execution
+                            let om = order_manager.clone();
+                            let sig = signal.clone();
+                            let books_snap = books.clone();
+                            let tx = exec_done_tx.clone();
+                            tokio::spawn(async move {
+                                let exec_result = async {
+                                    let mut execution = om.execute_arb(sig.clone(), Some(&books_snap)).await?;
+                                    if matches!(execution.status, ArbStatus::OneSideFilled { .. }) {
+                                        om.handle_one_side_fill(&mut execution, &books_snap).await?;
+                                    }
+                                    Ok::<_, anyhow::Error>(execution)
+                                }.await;
+                                match exec_result {
+                                    Ok(execution) => {
+                                        let _ = tx.send(ExecResult { signal: sig, execution }).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "async execution failed");
+                                        // Send error result back so executing flag gets cleared
+                                        let err_exec = om.make_error_execution(sig.clone(), &e.to_string());
+                                        let _ = tx.send(ExecResult { signal: sig, execution: err_exec }).await;
                                     }
                                 }
-                            }
-                            let trade_id = persist_execution(&store, &execution).await?;
-                            logger.log_execution(&execution);
-                            apply_execution_risk(&mut risk, &execution);
-                            let updated_stats = update_daily_stats(&store, &execution).await?;
-                            *state.risk_state.write().await = risk.snapshot(updated_stats.trades as u32);
-
-                            let profit = execution_realized_profit(&execution);
-                            broadcast_live(&live_tx, LiveMessage::OrderUpdate(OrderUpdateMessage {
-                                trade_id,
-                                status: execution_status_label(&execution).to_owned(),
-                                profit,
-                            }));
-                            if let Some(profit) = profit {
-                                broadcast_live(&live_tx, LiveMessage::BalanceUpdate(BalanceUpdateMessage {
-                                    usdc_balance: 0.0,
-                                    total_equity: profit,
-                                }));
-                            }
-                            *state.bot_status.write().await = BotStatus::Watching;
+                            });
                         }
                         RiskVeto::Rejected(reason) => {
                             logger.log_risk_veto(&reason);
@@ -243,10 +252,99 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Some(result) = exec_done_rx.recv() => {
+                executing = false;
+                let ExecResult { signal, execution } = result;
+
+                logger.log_execution(&execution);
+
+                let trade_id = match persist_execution(&store, &execution, &config).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = %e, status = execution_status_label(&execution), "persist_execution failed, trade not recorded");
+                        apply_execution_risk(&mut risk, &execution);
+                        *state.bot_status.write().await = BotStatus::Watching;
+                        continue;
+                    }
+                };
+
+                let _ = store.update_trade_extra(
+                    trade_id,
+                    execution.order_up.size,
+                    1,
+                    signal.vwap_up,
+                    signal.vwap_down,
+                ).await;
+
+                // MERGE: async spawn if both sides filled
+                if config.merge.enabled && matches!(execution.status, ArbStatus::BothFilled { .. }) {
+                    let merger_ref = merger.clone();
+                    let cond_id = signal.condition_id.clone();
+                    let filled_qty = execution.order_up.size;
+                    let tx = merge_done_tx.clone();
+                    let tid = trade_id;
+                    tokio::spawn(async move {
+                        let result = merger_ref.merge_positions(&cond_id, filled_qty).await
+                            .unwrap_or_else(|e| MergeResult::failed(&e.to_string()));
+                        let _ = tx.send((tid, result)).await;
+                    });
+                }
+
+                apply_execution_risk(&mut risk, &execution);
+                let updated_stats = match update_daily_stats(&store, &execution).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "update_daily_stats failed");
+                        store.today_stats().await.unwrap_or_default()
+                    }
+                };
+                *state.risk_state.write().await = risk.snapshot(updated_stats.trades as u32);
+
+                let profit = execution_realized_profit(&execution);
+                broadcast_live(&live_tx, LiveMessage::OrderUpdate(OrderUpdateMessage {
+                    trade_id,
+                    status: execution_status_label(&execution).to_owned(),
+                    profit,
+                }));
+                if let Some(profit) = profit {
+                    broadcast_live(&live_tx, LiveMessage::BalanceUpdate(BalanceUpdateMessage {
+                        usdc_balance: 0.0,
+                        total_equity: profit,
+                    }));
+                }
+                *state.bot_status.write().await = BotStatus::Watching;
+            }
+            _ = presign_ticker.tick() => {
+                market_pairs_buf.clear();
+                market_pairs_buf.extend(engine.markets().cloned());
+                let _ = order_manager.refresh_presigned_orders(&books, &market_pairs_buf).await;
+            }
             Some(user_event) = user_rx.recv() => {
                 let _ = order_manager.on_user_event(user_event).await;
             }
+            Some((trade_id, merge_result)) = merge_done_rx.recv() => {
+                let (merge_status, tx_hash, gas_cost) = if merge_result.success {
+                    tracing::info!(trade_id, tx_hash = ?merge_result.tx_hash, "merge completed");
+                    ("MERGED", merge_result.tx_hash.clone(), Some(merge_result.gas_cost))
+                } else {
+                    tracing::warn!(trade_id, error = ?merge_result.error, "merge failed");
+                    ("MERGE_FAILED", merge_result.tx_hash.clone(), Some(merge_result.gas_cost))
+                };
+                let _ = store.update_trade_merge(
+                    trade_id,
+                    merge_status,
+                    tx_hash.as_deref(),
+                    gas_cost,
+                ).await;
+                broadcast_live(&live_tx, LiveMessage::OrderUpdate(OrderUpdateMessage {
+                    trade_id,
+                    status: merge_status.to_owned(),
+                    profit: None, // profit already reported
+                }));
+            }
             _ = ticker.tick() => {
+                *state.current_books.write().await = books.clone();
+                *state.current_signal.write().await = cached_signal.clone();
                 let bot_status = state.bot_status.read().await.clone();
                 // 直接从 orderbook 读取当前 best ask，不依赖套利信号
                 let markets = state.current_markets.read().await.clone();
@@ -268,10 +366,17 @@ async fn main() -> Result<()> {
                 } else {
                     (None, None, None, None, None)
                 };
-                let net_profit = match sum {
-                    Some(s) if s < 1.0 => Some(1.0 - s - config.strategy.taker_fee_rate * 2.0),
-                    Some(s) => Some(1.0 - s),
-                    None => None,
+                let net_profit = match (ask_up, ask_down) {
+                    (Some(u), Some(d)) => {
+                        let curve_fees = fees::arb_fees(
+                            u, d,
+                            config.strategy.fee_curve_rate,
+                            config.strategy.fee_curve_exponent,
+                        );
+                        let gas = config.strategy.gas_per_order * 2.0;
+                        Some(1.0 - u - d - curve_fees - gas)
+                    }
+                    _ => None,
                 };
                 let ticker_message = TickerMessage {
                     ask_up,
@@ -311,9 +416,17 @@ async fn register_market(engine: &mut ArbEngine, state: &AppState, market: &Mark
     }
 }
 
-async fn persist_execution(store: &Store, execution: &ArbExecution) -> Result<i64> {
+async fn persist_execution(store: &Store, execution: &ArbExecution, config: &Config) -> Result<i64> {
     let net_profit = execution_realized_profit(execution);
     let status = execution_status_label(execution).to_owned();
+    let filled_qty = execution.order_up.size;
+    let curve_fees = fees::arb_fees(
+        execution.signal.ask_up,
+        execution.signal.ask_down,
+        config.strategy.fee_curve_rate,
+        config.strategy.fee_curve_exponent,
+    );
+    let gas_cost = config.strategy.gas_per_order * 2.0;
     let trade = ArbTradeRecord {
         id: 0,
         created_at: String::new(),
@@ -322,9 +435,9 @@ async fn persist_execution(store: &Store, execution: &ArbExecution) -> Result<i6
         ask_up: execution.signal.ask_up,
         ask_down: execution.signal.ask_down,
         total_cost: execution.signal.total_cost,
-        quantity: execution.signal.max_quantity,
-        fees: execution.signal.total_cost * execution.signal.max_quantity * 0.001,
-        gas: 0.014,
+        quantity: filled_qty,
+        fees: curve_fees * filled_qty,
+        gas: gas_cost,
         status,
         net_profit,
         settled: if net_profit.is_some() { 1 } else { 0 },

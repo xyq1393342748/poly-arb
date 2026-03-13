@@ -1851,6 +1851,7 @@ name = "poly-arb"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "anyhow",
  "axum",
  "base64",

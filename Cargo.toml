@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
+alloy-rlp = "0.3"
 anyhow = "1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"

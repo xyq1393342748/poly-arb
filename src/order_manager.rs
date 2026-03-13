@@ -16,6 +16,7 @@ use crate::{
     arb_engine::{ArbSignal, MarketPair},
     auth::{ApiAuth, OrderData, OrderSigner, ZERO_ADDRESS},
     config::Config,
+    fees,
     orderbook::OrderBookManager,
     presigner::PreSignedOrderPool,
     types::{OrderStatus, OrderType, Side},
@@ -354,9 +355,14 @@ impl OrderManager {
                 break;
             };
             let sum = ask_up + ask_down;
-            let fees = sum * self.config.strategy.taker_fee_rate;
+            let curve_fees = fees::arb_fees(
+                ask_up,
+                ask_down,
+                self.config.strategy.fee_curve_rate,
+                self.config.strategy.fee_curve_exponent,
+            );
             let gas = self.config.strategy.gas_per_order * 2.0;
-            if sum + fees + gas >= 1.0 {
+            if sum + curve_fees + gas >= 1.0 {
                 break;
             }
 
@@ -403,11 +409,43 @@ impl OrderManager {
             let down_filled = result_is_filled(&down_result);
             if up_filled && down_filled {
                 total_filled += batch_size;
-                total_profit += (1.0 - sum - fees - gas) * batch_size;
+                total_profit += (1.0 - sum - curve_fees - gas) * batch_size;
                 last_order_id_up = up_result.order_id.clone();
                 last_order_id_down = down_result.order_id.clone();
+            } else if up_filled != down_filled {
+                // 一侧成交另一侧未成交：返回 OneSideFilled 让 handle_one_side_fill 处理
+                let (filled_side, recovery_order_id) = if up_filled {
+                    ("UP".to_owned(), up_result.order_id.clone().unwrap_or_default())
+                } else {
+                    ("DOWN".to_owned(), down_result.order_id.clone().unwrap_or_default())
+                };
+                return Ok(ArbExecution {
+                    signal: signal.clone(),
+                    order_up: OrderRequest {
+                        token_id: signal.token_id_up.clone(),
+                        side: Side::Buy,
+                        price: ask_up,
+                        size: batch_size,
+                        order_type: OrderType::Fok,
+                        expiration,
+                    },
+                    order_down: OrderRequest {
+                        token_id: signal.token_id_down.clone(),
+                        side: Side::Buy,
+                        price: ask_down,
+                        size: batch_size,
+                        order_type: OrderType::Fok,
+                        expiration,
+                    },
+                    status: ArbStatus::OneSideFilled {
+                        filled_side,
+                        recovery_order_id,
+                    },
+                    order_id_up: up_result.order_id,
+                    order_id_down: down_result.order_id,
+                });
             } else {
-                // 如果一侧成功另一侧失败，停止后续批次
+                // 两侧都未成交，停止后续批次
                 break;
             }
 
@@ -482,8 +520,13 @@ impl OrderManager {
             .and_then(|book| book.best_ask())
         {
             let total = filled_order.price + ask;
-            let fees = total * self.config.strategy.taker_fee_rate;
-            if available >= filled_order.size && total + fees < 1.0 {
+            let rescue_fees = fees::arb_fees(
+                filled_order.price,
+                ask,
+                self.config.strategy.fee_curve_rate,
+                self.config.strategy.fee_curve_exponent,
+            );
+            if available >= filled_order.size && total + rescue_fees < 1.0 {
                 let rescue_future = self.submit_single_order(
                     &unfilled_order.token_id,
                     Side::Buy,
@@ -503,7 +546,7 @@ impl OrderManager {
                             execution.order_id_up = result.order_id.clone();
                         }
                         execution.status = ArbStatus::Rescued {
-                            actual_profit: round4((1.0 - total - fees) * filled_order.size),
+                            actual_profit: round4((1.0 - total - rescue_fees) * filled_order.size),
                         };
                         return Ok(());
                     }
@@ -532,11 +575,14 @@ impl OrderManager {
                 )
                 .await?;
             if result_is_filled(&result) || result_is_active(&result) {
-                let fees = (filled_order.price + sell_price)
-                    * filled_order.size
-                    * self.config.strategy.taker_fee_rate;
+                let sell_fees = fees::arb_fees(
+                    filled_order.price,
+                    sell_price,
+                    self.config.strategy.fee_curve_rate,
+                    self.config.strategy.fee_curve_exponent,
+                ) * filled_order.size;
                 let loss =
-                    round4(((filled_order.price - sell_price).max(0.0) * filled_order.size) + fees);
+                    round4(((filled_order.price - sell_price).max(0.0) * filled_order.size) + sell_fees);
                 execution.status = ArbStatus::LossStopped { loss };
                 return Ok(());
             }
@@ -591,7 +637,15 @@ impl OrderManager {
             payloads.push(self.build_payload_for_request(request).await?);
         }
 
-        let body = serde_json::to_string(&payloads)?;
+        let mut body = String::with_capacity(payloads.iter().map(String::len).sum::<usize>() + 2 + payloads.len().saturating_sub(1));
+        body.push('[');
+        for (index, payload) in payloads.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push_str(payload);
+        }
+        body.push(']');
         let headers = self.auth.sign_request("POST", "/orders", &body, now_ts())?;
         let response = self
             .client
@@ -676,15 +730,19 @@ impl OrderManager {
         let status = body
             .get("status")
             .and_then(Value::as_str)
-            .unwrap_or("UNKNOWN")
-            .to_uppercase();
-        Ok(match status.as_str() {
-            "LIVE" => OrderStatus::Live,
-            "MATCHED" => OrderStatus::Matched,
-            "CANCELLED" => OrderStatus::Cancelled,
-            "EXPIRED" => OrderStatus::Expired,
-            "REJECTED" => OrderStatus::Rejected,
-            _ => OrderStatus::Unknown,
+            .unwrap_or("UNKNOWN");
+        Ok(if status.eq_ignore_ascii_case("LIVE") {
+            OrderStatus::Live
+        } else if status.eq_ignore_ascii_case("MATCHED") {
+            OrderStatus::Matched
+        } else if status.eq_ignore_ascii_case("CANCELLED") {
+            OrderStatus::Cancelled
+        } else if status.eq_ignore_ascii_case("EXPIRED") {
+            OrderStatus::Expired
+        } else if status.eq_ignore_ascii_case("REJECTED") {
+            OrderStatus::Rejected
+        } else {
+            OrderStatus::Unknown
         })
     }
 
@@ -713,16 +771,15 @@ impl OrderManager {
         Ok(())
     }
 
-    async fn build_payload_for_request(&self, request: &OrderRequest) -> Result<Value> {
+    async fn build_payload_for_request(&self, request: &OrderRequest) -> Result<String> {
         if request.side == Side::Buy {
             if let Some(presigner) = &self.presigner {
-                let mut payload = presigner.lock().await.get_or_sign(
+                let payload = presigner.lock().await.get_or_sign(
                     &request.token_id,
                     request.price,
                     request.size,
                 )?;
-                hydrate_payload(&mut payload, &self.auth.api_key, request.order_type)?;
-                return Ok(payload);
+                return hydrate_payload(&payload, &self.auth.api_key, request.order_type);
             }
         }
 
@@ -734,13 +791,13 @@ impl OrderManager {
             request,
             signer,
             &self.auth.api_key,
-            self.config.strategy.taker_fee_rate,
+            self.config.strategy.fee_curve_rate,
+            self.config.strategy.fee_curve_exponent,
         )
     }
 
     async fn submit_order_result(&self, request: &OrderRequest) -> Result<BatchOrderResult> {
-        let payload = self.build_payload_for_request(request).await?;
-        let body = serde_json::to_string(&payload)?;
+        let body = self.build_payload_for_request(request).await?;
         let headers = self.auth.sign_request("POST", "/order", &body, now_ts())?;
         let response = self
             .client
@@ -767,14 +824,40 @@ impl OrderManager {
     fn default_expiration(&self) -> u64 {
         now_ts() + self.config.optimization.presign_ttl_sec.max(1)
     }
+
+    pub fn make_error_execution(&self, signal: ArbSignal, error: &str) -> ArbExecution {
+        ArbExecution {
+            order_up: OrderRequest {
+                token_id: signal.token_id_up.clone(),
+                side: Side::Buy,
+                price: signal.ask_up,
+                size: 0.0,
+                order_type: OrderType::Fok,
+                expiration: self.default_expiration(),
+            },
+            order_down: OrderRequest {
+                token_id: signal.token_id_down.clone(),
+                side: Side::Buy,
+                price: signal.ask_down,
+                size: 0.0,
+                order_type: OrderType::Fok,
+                expiration: self.default_expiration(),
+            },
+            signal,
+            status: ArbStatus::Error(error.to_owned()),
+            order_id_up: None,
+            order_id_down: None,
+        }
+    }
 }
 
 fn build_order_payload(
     request: &OrderRequest,
     signer: &OrderSigner,
     owner: &str,
-    taker_fee_rate: f64,
-) -> Result<Value> {
+    fee_curve_rate: f64,
+    fee_curve_exponent: u32,
+) -> Result<String> {
     let price = round_to(request.price, 2);
     let size = round_to(request.size, 2);
     let collateral_units = scale_to_u256(price * size, 6)?;
@@ -785,7 +868,7 @@ fn build_order_payload(
     };
     let salt = random_u64();
     let nonce = now_ts();
-    let fee_rate_bps = (taker_fee_rate * 10_000.0).round() as u64;
+    let fee_rate_bps = fees::fee_bps_for_price(price, fee_curve_rate, fee_curve_exponent, 50);
     let order_data = OrderData {
         salt: U256::from(salt),
         maker: signer.address,
@@ -811,7 +894,7 @@ fn build_order_payload(
         verifying_contract: OrderSigner::default_exchange(signer.chain_id, false)?,
     };
     let signature = signer.sign_order(&order_data)?;
-    Ok(serde_json::json!({
+    let payload = serde_json::json!({
         "deferExec": false,
         "order": {
             "salt": salt,
@@ -830,20 +913,19 @@ fn build_order_payload(
         },
         "owner": owner,
         "orderType": request.order_type.as_str(),
-    }))
+    });
+    Ok(serde_json::to_string(&payload)?)
 }
 
-fn hydrate_payload(payload: &mut Value, owner: &str, order_type: OrderType) -> Result<()> {
-    let Some(object) = payload.as_object_mut() else {
-        bail!("signed payload must be a JSON object");
-    };
-    object.insert("owner".to_owned(), Value::String(owner.to_owned()));
-    object.insert(
-        "orderType".to_owned(),
-        Value::String(order_type.as_str().to_owned()),
-    );
-    object.insert("deferExec".to_owned(), Value::Bool(false));
-    Ok(())
+fn hydrate_payload(payload: &str, owner: &str, order_type: OrderType) -> Result<String> {
+    if !payload.contains("\"__OWNER__\"") || !payload.contains("\"__ORDER_TYPE__\"") {
+        bail!("signed payload missing hydration placeholders");
+    }
+    let owner = serde_json::to_string(owner)?;
+    let order_type = serde_json::to_string(order_type.as_str())?;
+    Ok(payload
+        .replace("\"__OWNER__\"", &owner)
+        .replace("\"__ORDER_TYPE__\"", &order_type))
 }
 
 fn parse_batch_order_result(value: &Value) -> BatchOrderResult {
@@ -877,10 +959,7 @@ fn result_is_filled(result: &BatchOrderResult) -> bool {
         return false;
     }
     match result.status.as_deref() {
-        Some(status) => {
-            let status = status.to_ascii_uppercase();
-            status == "MATCHED" || status == "FILLED"
-        }
+        Some(status) => status.eq_ignore_ascii_case("MATCHED") || status.eq_ignore_ascii_case("FILLED"),
         None => false,
     }
 }
@@ -895,20 +974,41 @@ fn scale_to_u256(value: f64, decimals: u32) -> Result<U256> {
 
 fn to_headers(auth: &crate::auth::AuthHeaders) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    insert_header(&mut headers, "POLY_ADDRESS", &auth.poly_address)?;
-    insert_header(&mut headers, "POLY_SIGNATURE", &auth.poly_signature)?;
-    insert_header(&mut headers, "POLY_TIMESTAMP", &auth.poly_timestamp)?;
-    insert_header(&mut headers, "POLY_API_KEY", &auth.poly_api_key)?;
-    insert_header(&mut headers, "POLY_PASSPHRASE", &auth.poly_passphrase)?;
-    insert_header(&mut headers, "Content-Type", "application/json")?;
+    insert_header(
+        &mut headers,
+        HeaderName::from_static("poly_address"),
+        &auth.poly_address,
+    )?;
+    insert_header(
+        &mut headers,
+        HeaderName::from_static("poly_signature"),
+        &auth.poly_signature,
+    )?;
+    insert_header(
+        &mut headers,
+        HeaderName::from_static("poly_timestamp"),
+        &auth.poly_timestamp,
+    )?;
+    insert_header(
+        &mut headers,
+        HeaderName::from_static("poly_api_key"),
+        &auth.poly_api_key,
+    )?;
+    insert_header(
+        &mut headers,
+        HeaderName::from_static("poly_passphrase"),
+        &auth.poly_passphrase,
+    )?;
+    insert_header(
+        &mut headers,
+        HeaderName::from_static("content-type"),
+        "application/json",
+    )?;
     Ok(headers)
 }
 
-fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
-    headers.insert(
-        HeaderName::from_bytes(name.as_bytes())?,
-        HeaderValue::from_str(value)?,
-    );
+fn insert_header(headers: &mut HeaderMap, name: HeaderName, value: &str) -> Result<()> {
+    headers.insert(name, HeaderValue::from_str(value)?);
     Ok(())
 }
 

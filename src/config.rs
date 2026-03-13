@@ -198,6 +198,10 @@ pub struct StrategyConfig {
     pub batch_max_chunks: u32,
     #[serde(default = "default_batch_delay_ms")]
     pub batch_delay_ms: u64,
+    #[serde(default = "default_fee_curve_rate")]
+    pub fee_curve_rate: f64,
+    #[serde(default = "default_fee_curve_exponent")]
+    pub fee_curve_exponent: u32,
 }
 
 fn default_batch_enabled() -> bool {
@@ -212,6 +216,12 @@ fn default_batch_max_chunks() -> u32 {
 fn default_batch_delay_ms() -> u64 {
     100
 }
+fn default_fee_curve_rate() -> f64 {
+    0.25
+}
+fn default_fee_curve_exponent() -> u32 {
+    2
+}
 
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -224,6 +234,8 @@ impl Default for StrategyConfig {
             batch_chunk_usd: 75.0,
             batch_max_chunks: 10,
             batch_delay_ms: 100,
+            fee_curve_rate: 0.25,
+            fee_curve_exponent: 2,
         }
     }
 }

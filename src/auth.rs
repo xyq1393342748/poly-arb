@@ -47,6 +47,7 @@ pub struct L1AuthHeaders {
 pub struct ApiAuth {
     pub api_key: String,
     pub secret: String,
+    decoded_secret: Vec<u8>,
     pub passphrase: String,
     pub address: Option<String>,
 }
@@ -58,9 +59,19 @@ impl ApiAuth {
         passphrase: impl Into<String>,
         address: Option<String>,
     ) -> Self {
+        let secret = secret.into();
+        let decoded_secret = if secret.is_empty() {
+            Vec::new()
+        } else {
+            decode_secret(&secret).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to decode API secret, signing will fail");
+                Vec::new()
+            })
+        };
         Self {
             api_key: api_key.into(),
-            secret: secret.into(),
+            decoded_secret,
+            secret,
             passphrase: passphrase.into(),
             address,
         }
@@ -73,10 +84,10 @@ impl ApiAuth {
         body: &str,
         timestamp: u64,
     ) -> Result<AuthHeaders> {
-        let secret = decode_secret(&self.secret)?;
-        let message = format!("{timestamp}{}{path}{body}", method.to_uppercase());
+        debug_assert!(method.bytes().all(|b| !b.is_ascii_lowercase()), "method must be uppercase");
+        let message = format!("{timestamp}{method}{path}{body}");
         let mut mac =
-            HmacSha256::new_from_slice(&secret).map_err(|_| anyhow!("invalid HMAC secret"))?;
+            HmacSha256::new_from_slice(&self.decoded_secret).map_err(|_| anyhow!("invalid HMAC secret"))?;
         mac.update(message.as_bytes());
         let signature = URL_SAFE.encode(mac.finalize().into_bytes());
         Ok(AuthHeaders {

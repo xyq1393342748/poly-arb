@@ -1,6 +1,7 @@
 pub mod arb_engine;
 pub mod auth;
 pub mod config;
+pub mod fees;
 pub mod logger;
 pub mod market_discovery;
 pub mod order_manager;

@@ -3,9 +3,20 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::StrategyConfig, orderbook::OrderBookManager};
+use crate::{config::StrategyConfig, fees, orderbook::{DepthAnalysis, OrderBookManager}};
 
 const STALE_THRESHOLD_MS: u64 = 5_000;
+
+/// Lightweight scoring result — no String clones, just numbers.
+struct PairScore<'a> {
+    pair: &'a MarketPair,
+    depth: DepthAnalysis,
+    net_profit: f64,
+    total_cost: f64,
+    max_quantity: f64,
+    books_stale: bool,
+    time_to_expiry_sec: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ArbEngine {
@@ -58,14 +69,24 @@ impl ArbEngine {
         self.markets.remove(condition_id);
     }
 
-    pub fn evaluate(&self, books: &OrderBookManager) -> Vec<ArbSignal> {
-        self.markets
+    /// Find the single best signal, zero-alloc scoring. Scores all pairs numerically first (no String clones),
+    /// then materializes only the winner into a full ArbSignal.
+    pub fn evaluate_best(&self, books: &OrderBookManager) -> Option<ArbSignal> {
+        let now = Utc::now();
+        let best = self.markets
             .values()
-            .filter_map(|pair| self.evaluate_pair(pair, books))
-            .collect()
+            .filter_map(|pair| self.score_pair(pair, books, now))
+            .max_by(|a, b| a.net_profit.partial_cmp(&b.net_profit).unwrap_or(std::cmp::Ordering::Equal))?;
+        Some(self.materialize_signal(best, now))
     }
 
-    pub fn evaluate_pair(&self, pair: &MarketPair, books: &OrderBookManager) -> Option<ArbSignal> {
+    /// Numeric-only scoring — no String allocations.
+    fn score_pair<'a>(
+        &self,
+        pair: &'a MarketPair,
+        books: &OrderBookManager,
+        now: DateTime<Utc>,
+    ) -> Option<PairScore<'a>> {
         let (ask_up, _size_up, ask_down, _size_down) =
             books.get_pair_asks(&pair.token_id_up, &pair.token_id_down)?;
         let up_book = books.get_book(&pair.token_id_up)?;
@@ -84,50 +105,69 @@ impl ArbEngine {
             &pair.token_id_up,
             &pair.token_id_down,
             position_limited,
-            self.config.taker_fee_rate,
+            self.config.fee_curve_rate,
+            self.config.fee_curve_exponent,
             gas,
         )?;
 
         let total_cost = depth.vwap_up + depth.vwap_down;
-        let fees = total_cost * self.config.taker_fee_rate;
+        let fees = fees::arb_fees(
+            depth.vwap_up,
+            depth.vwap_down,
+            self.config.fee_curve_rate,
+            self.config.fee_curve_exponent,
+        );
         let net_profit = 1.0 - total_cost - fees - gas;
         if net_profit <= self.config.min_profit {
             return None;
         }
 
-        let time_to_expiry_sec = (pair.end_date - Utc::now()).num_seconds();
+        let time_to_expiry_sec = (pair.end_date - now).num_seconds();
         if time_to_expiry_sec <= 0 {
             return None;
         }
 
-        let depth_limited = depth.max_profitable_size;
-        let max_quantity = round4(depth_limited.min(position_limited));
+        let max_quantity = round4(depth.max_profitable_size.min(position_limited));
         if max_quantity <= 0.0 {
             return None;
         }
 
-        Some(ArbSignal {
+        Some(PairScore {
+            pair,
+            depth,
+            net_profit,
+            total_cost,
+            max_quantity,
+            books_stale,
+            time_to_expiry_sec,
+        })
+    }
+
+    /// Materialize the full ArbSignal (with String clones) only for the chosen winner.
+    fn materialize_signal(&self, score: PairScore<'_>, now: DateTime<Utc>) -> ArbSignal {
+        let pair = score.pair;
+        ArbSignal {
             condition_id: pair.condition_id.clone(),
             question: pair.question.clone(),
             token_id_up: pair.token_id_up.clone(),
             token_id_down: pair.token_id_down.clone(),
-            ask_up,
-            ask_down,
-            total_cost,
-            net_profit,
-            max_quantity,
-            position_notional: round4(max_quantity * total_cost),
-            profit_rate: if total_cost > 0.0 {
-                round4(net_profit / total_cost)
+            ask_up: score.depth.best_ask_up,
+            ask_down: score.depth.best_ask_down,
+            total_cost: score.total_cost,
+            net_profit: score.net_profit,
+            max_quantity: score.max_quantity,
+            position_notional: round4(score.max_quantity * score.total_cost),
+            profit_rate: if score.total_cost > 0.0 {
+                round4(score.net_profit / score.total_cost)
             } else {
                 0.0
             },
-            vwap_up: depth.vwap_up,
-            vwap_down: depth.vwap_down,
-            time_to_expiry_sec,
-            books_stale,
-            timestamp: Utc::now(),
-        })
+            vwap_up: score.depth.vwap_up,
+            vwap_down: score.depth.vwap_down,
+            time_to_expiry_sec: score.time_to_expiry_sec,
+            books_stale: score.books_stale,
+            timestamp: now,
+        }
     }
 
     pub fn markets(&self) -> impl Iterator<Item = &MarketPair> {

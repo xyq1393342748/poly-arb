@@ -6,14 +6,14 @@ use std::{
 use alloy_primitives::U256;
 use anyhow::{bail, Result};
 use rand::RngCore;
-use serde_json::Value;
 
 use crate::{
     arb_engine::MarketPair,
     auth::{OrderData, OrderSigner, ZERO_ADDRESS},
     config::{OptimizationConfig, StrategyConfig},
+    fees,
     orderbook::OrderBookManager,
-    types::{OrderType, Side},
+    types::Side,
 };
 
 #[derive(Debug, Clone)]
@@ -26,7 +26,8 @@ pub struct PreSignedOrderPool {
 
 #[derive(Debug, Clone)]
 struct PreSignedEntry {
-    payload: Value,
+    payload: String,
+    taker_amount_scaled: u128,
     created_at: Instant,
 }
 
@@ -46,7 +47,6 @@ impl PreSignedOrderPool {
 
     pub fn refresh(&mut self, books: &OrderBookManager, markets: &[MarketPair]) {
         self.evict_stale();
-        let mut refreshed_keys = HashSet::new();
 
         for market in markets {
             let Some((ask_up, size_up, ask_down, size_down)) =
@@ -67,59 +67,67 @@ impl PreSignedOrderPool {
             }
 
             for price in price_levels(ask_up, self.optimization.presign_price_offsets) {
-                if let Ok(payload) = self.sign_payload(&market.token_id_up, price, quantity) {
+                let key = (market.token_id_up.clone(), price_to_cents(price));
+                if let Some(entry) = self.cache.get(&key) {
+                    let half_ttl = Duration::from_secs(self.optimization.presign_ttl_sec / 2);
+                    if entry.created_at.elapsed() < half_ttl {
+                        continue;
+                    }
+                }
+                if let Ok((payload, taker_amount)) =
+                    self.sign_payload(&market.token_id_up, price, quantity)
+                {
                     let key = (market.token_id_up.clone(), price_to_cents(price));
-                    refreshed_keys.insert(key.clone());
                     self.cache.insert(
                         key,
                         PreSignedEntry {
                             payload,
+                            taker_amount_scaled: taker_amount,
                             created_at: Instant::now(),
                         },
                     );
                 }
             }
             for price in price_levels(ask_down, self.optimization.presign_price_offsets) {
-                if let Ok(payload) = self.sign_payload(&market.token_id_down, price, quantity) {
+                let key = (market.token_id_down.clone(), price_to_cents(price));
+                if let Some(entry) = self.cache.get(&key) {
+                    let half_ttl = Duration::from_secs(self.optimization.presign_ttl_sec / 2);
+                    if entry.created_at.elapsed() < half_ttl {
+                        continue;
+                    }
+                }
+                if let Ok((payload, taker_amount)) =
+                    self.sign_payload(&market.token_id_down, price, quantity)
+                {
                     let key = (market.token_id_down.clone(), price_to_cents(price));
-                    refreshed_keys.insert(key.clone());
                     self.cache.insert(
                         key,
                         PreSignedEntry {
                             payload,
+                            taker_amount_scaled: taker_amount,
                             created_at: Instant::now(),
                         },
                     );
                 }
             }
         }
-
-        // Only evict stale entries; don't aggressively drop entries for
-        // prices that didn't appear in this refresh cycle — the ask may
-        // return on the next book update and the cached signature is still valid.
-        self.evict_stale();
     }
 
-    pub fn get_or_sign(&mut self, token_id: &str, price: f64, size: f64) -> Result<Value> {
-        self.evict_stale();
+    pub fn get_or_sign(&mut self, token_id: &str, price: f64, size: f64) -> Result<String> {
         let key = (token_id.to_owned(), price_to_cents(price));
+        let expected_scaled = scale_to_scaled_u128(round_to(size, 2), 6);
         if let Some(entry) = self.cache.get(&key) {
-            let expected_size = scale_to_u256(round_to(size, 2), 6)?.to_string();
-            let signed_size = entry
-                .payload
-                .pointer("/order/takerAmount")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if signed_size == expected_size {
+            if entry.taker_amount_scaled == expected_scaled {
                 return Ok(entry.payload.clone());
             }
         }
 
-        let payload = self.sign_payload(token_id, price, size)?;
+        let (payload, taker_amount_scaled) = self.sign_payload(token_id, price, size)?;
         self.cache.insert(
             key,
             PreSignedEntry {
                 payload: payload.clone(),
+                taker_amount_scaled,
                 created_at: Instant::now(),
             },
         );
@@ -134,7 +142,7 @@ impl PreSignedOrderPool {
             .retain(|_, entry| entry.created_at.elapsed() <= ttl);
     }
 
-    fn sign_payload(&self, token_id: &str, price: f64, size: f64) -> Result<Value> {
+    fn sign_payload(&self, token_id: &str, price: f64, size: f64) -> Result<(String, u128)> {
         let price = round_to(price, 2);
         let size = round_to(size, 2);
         if price <= 0.0 || size <= 0.0 {
@@ -143,7 +151,12 @@ impl PreSignedOrderPool {
 
         let salt = random_u64();
         let nonce = now_ts();
-        let fee_rate_bps = (self.config.taker_fee_rate * 10_000.0).round() as u64;
+        let fee_rate_bps = fees::fee_bps_for_price(
+            price,
+            self.config.fee_curve_rate,
+            self.config.fee_curve_exponent,
+            50,
+        );
         let collateral_units = scale_to_u256(price * size, 6)?;
         let conditional_units = scale_to_u256(size, 6)?;
         let expiration = now_ts() + self.optimization.presign_ttl_sec.max(1);
@@ -164,7 +177,9 @@ impl PreSignedOrderPool {
             verifying_contract: OrderSigner::default_exchange(self.signer.chain_id, false)?,
         };
         let signature = self.signer.sign_order(&order_data)?;
-        Ok(serde_json::json!({
+        let taker_amount_str = order_data.taker_amount.to_string();
+        let taker_amount_scaled = scale_to_scaled_u128(size, 6);
+        let payload = serde_json::json!({
             "deferExec": false,
             "order": {
                 "salt": salt,
@@ -173,7 +188,7 @@ impl PreSignedOrderPool {
                 "taker": ZERO_ADDRESS.to_string(),
                 "tokenId": token_id,
                 "makerAmount": order_data.maker_amount.to_string(),
-                "takerAmount": order_data.taker_amount.to_string(),
+                "takerAmount": taker_amount_str,
                 "side": Side::Buy.as_str(),
                 "expiration": expiration.to_string(),
                 "nonce": nonce.to_string(),
@@ -181,9 +196,10 @@ impl PreSignedOrderPool {
                 "signatureType": 0,
                 "signature": signature,
             },
-            "owner": "",
-            "orderType": OrderType::Fok.as_str(),
-        }))
+            "owner": "__OWNER__",
+            "orderType": "__ORDER_TYPE__",
+        });
+        Ok((serde_json::to_string(&payload)?, taker_amount_scaled))
     }
 }
 
@@ -204,6 +220,10 @@ fn price_levels(base_price: f64, offsets: u32) -> Vec<f64> {
         }
     }
     prices
+}
+
+fn scale_to_scaled_u128(value: f64, decimals: u32) -> u128 {
+    (value * 10_f64.powi(decimals as i32)).round() as u128
 }
 
 fn scale_to_u256(value: f64, decimals: u32) -> Result<U256> {

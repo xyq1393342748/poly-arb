@@ -166,13 +166,9 @@ fn parse_market_value(value: &Value) -> Option<BookUpdate> {
             let mut bids = Vec::new();
             let mut asks = Vec::new();
             for change in changes {
-                let side = change
-                    .get("side")
-                    .and_then(Value::as_str)
-                    .unwrap_or("BUY")
-                    .to_uppercase();
+                let side = change.get("side").and_then(Value::as_str).unwrap_or("BUY");
                 let level = parse_level(change)?;
-                if side == "SELL" || side == "ASK" {
+                if side.eq_ignore_ascii_case("SELL") || side.eq_ignore_ascii_case("ASK") {
                     asks.push(level);
                 } else {
                     bids.push(level);

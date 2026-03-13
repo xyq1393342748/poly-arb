@@ -6,7 +6,7 @@ use std::{
 use ordered_float::OrderedFloat;
 use serde::Serialize;
 
-use crate::{types::PriceLevel, ws_market::BookUpdate};
+use crate::{fees, types::PriceLevel, ws_market::BookUpdate};
 
 #[derive(Debug, Clone)]
 pub struct OrderBook {
@@ -203,7 +203,8 @@ impl OrderBookManager {
         up_id: &str,
         down_id: &str,
         target_size: f64,
-        fee_rate: f64,
+        fee_curve_rate: f64,
+        fee_curve_exponent: u32,
         gas: f64,
     ) -> Option<DepthAnalysis> {
         let up_book = self.books.get(up_id)?;
@@ -211,31 +212,19 @@ impl OrderBookManager {
         let (best_ask_up, best_size_up) = up_book.best_ask()?;
         let (best_ask_down, best_size_down) = down_book.best_ask()?;
 
-        let up_asks: Vec<(f64, f64)> = up_book.ask_levels().collect();
-        let down_asks: Vec<(f64, f64)> = down_book.ask_levels().collect();
-
-        // 双指针扫描计算 max_profitable_size
-        let threshold = 1.0 - fee_rate * 2.0 - gas;
-        let mut ui = 0usize;
-        let mut di = 0usize;
-        let mut u_remaining = if !up_asks.is_empty() {
-            up_asks[0].1
-        } else {
-            0.0
-        };
-        let mut d_remaining = if !down_asks.is_empty() {
-            down_asks[0].1
-        } else {
-            0.0
-        };
+        let mut up_asks = up_book.ask_levels().peekable();
+        let mut down_asks = down_book.ask_levels().peekable();
+        let mut u_remaining = up_asks.peek().map(|(_, size)| *size).unwrap_or(0.0);
+        let mut d_remaining = down_asks.peek().map(|(_, size)| *size).unwrap_or(0.0);
         let mut profitable_size = 0.0;
         let mut total_up_cost = 0.0;
         let mut total_down_cost = 0.0;
 
-        while ui < up_asks.len() && di < down_asks.len() {
-            let up_price = up_asks[ui].0;
-            let down_price = down_asks[di].0;
-            if up_price + down_price >= threshold {
+        while let (Some((up_price, _)), Some((down_price, _))) =
+            (up_asks.peek().copied(), down_asks.peek().copied())
+        {
+            let level_fees = fees::arb_fees(up_price, down_price, fee_curve_rate, fee_curve_exponent);
+            if up_price + down_price + level_fees + gas >= 1.0 {
                 break;
             }
             let take = u_remaining
@@ -250,16 +239,12 @@ impl OrderBookManager {
             u_remaining -= take;
             d_remaining -= take;
             if u_remaining <= 0.0 {
-                ui += 1;
-                if ui < up_asks.len() {
-                    u_remaining = up_asks[ui].1;
-                }
+                up_asks.next();
+                u_remaining = up_asks.peek().map(|(_, size)| *size).unwrap_or(0.0);
             }
             if d_remaining <= 0.0 {
-                di += 1;
-                if di < down_asks.len() {
-                    d_remaining = down_asks[di].1;
-                }
+                down_asks.next();
+                d_remaining = down_asks.peek().map(|(_, size)| *size).unwrap_or(0.0);
             }
             if profitable_size >= target_size {
                 break;

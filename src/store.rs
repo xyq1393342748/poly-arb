@@ -271,6 +271,46 @@ impl Store {
         })
     }
 
+    pub async fn update_trade_merge(
+        &self,
+        id: i64,
+        merge_status: &str,
+        tx_hash: Option<&str>,
+        gas_cost: Option<f64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE arb_trades SET merge_status = ?1, merge_tx_hash = ?2, merge_gas_cost = ?3 WHERE id = ?4",
+        )
+        .bind(merge_status)
+        .bind(tx_hash)
+        .bind(gas_cost)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_trade_extra(
+        &self,
+        id: i64,
+        filled_qty: f64,
+        batch_count: u32,
+        vwap_up: f64,
+        vwap_down: f64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE arb_trades SET filled_quantity = ?1, batch_count = ?2, vwap_up = ?3, vwap_down = ?4 WHERE id = ?5",
+        )
+        .bind(filled_qty)
+        .bind(batch_count as i64)
+        .bind(vwap_up)
+        .bind(vwap_down)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn recent_opportunities(&self, limit: u32) -> Result<Vec<OpportunityRecord>> {
         sqlx::query_as::<_, OpportunityRecord>(
             "SELECT * FROM opportunities ORDER BY id DESC LIMIT ?1",
