@@ -100,6 +100,10 @@ impl Store {
         for statement in MIGRATIONS {
             sqlx::query(statement).execute(&self.pool).await?;
         }
+        // Schema extensions — ignore errors if columns already exist
+        for alter in SCHEMA_EXTENSIONS {
+            let _ = sqlx::query(alter).execute(&self.pool).await;
+        }
         Ok(())
     }
 
@@ -324,4 +328,14 @@ const MIGRATIONS: &[&str] = &[
         executed INTEGER NOT NULL DEFAULT 0,
         skip_reason TEXT
     )",
+];
+
+const SCHEMA_EXTENSIONS: &[&str] = &[
+    "ALTER TABLE arb_trades ADD COLUMN merge_status TEXT DEFAULT NULL",
+    "ALTER TABLE arb_trades ADD COLUMN merge_tx_hash TEXT DEFAULT NULL",
+    "ALTER TABLE arb_trades ADD COLUMN merge_gas_cost REAL DEFAULT NULL",
+    "ALTER TABLE arb_trades ADD COLUMN filled_quantity REAL DEFAULT NULL",
+    "ALTER TABLE arb_trades ADD COLUMN batch_count INTEGER DEFAULT NULL",
+    "ALTER TABLE arb_trades ADD COLUMN vwap_up REAL DEFAULT NULL",
+    "ALTER TABLE arb_trades ADD COLUMN vwap_down REAL DEFAULT NULL",
 ];

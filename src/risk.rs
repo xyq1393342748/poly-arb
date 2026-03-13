@@ -128,6 +128,8 @@ impl RiskManager {
                 max_quantity: 0.0,
                 position_notional: 1.0,
                 profit_rate: f64::MAX,
+                vwap_up: 0.0,
+                vwap_down: 0.0,
                 time_to_expiry_sec: 60,
                 books_stale: false,
                 timestamp: Utc::now(),

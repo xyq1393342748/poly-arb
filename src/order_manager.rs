@@ -69,6 +69,14 @@ pub enum ArbStatus {
         loss: f64,
     },
     BothCancelled,
+    Merged {
+        profit: f64,
+        tx_hash: String,
+    },
+    MergeFailed {
+        profit: f64,
+        reason: String,
+    },
     Error(String),
 }
 
@@ -148,7 +156,25 @@ impl OrderManager {
         Ok(())
     }
 
-    pub async fn execute_arb(&self, signal: ArbSignal) -> Result<ArbExecution> {
+    pub async fn execute_arb(
+        &self,
+        signal: ArbSignal,
+        books: Option<&OrderBookManager>,
+    ) -> Result<ArbExecution> {
+        if self.config.strategy.batch_enabled {
+            if let Some(books) = books {
+                return self
+                    .execute_arb_batched(
+                        signal,
+                        books,
+                        self.config.strategy.batch_chunk_usd,
+                        self.config.strategy.batch_max_chunks,
+                        self.config.strategy.batch_delay_ms,
+                    )
+                    .await;
+            }
+        }
+
         let expiration = self.default_expiration();
         let order_up = OrderRequest {
             token_id: signal.token_id_up.clone(),
@@ -268,6 +294,158 @@ impl OrderManager {
         };
 
         Ok(execution)
+    }
+
+    pub async fn execute_arb_batched(
+        &self,
+        signal: ArbSignal,
+        books: &OrderBookManager,
+        chunk_usd: f64,
+        max_chunks: u32,
+        delay_ms: u64,
+    ) -> Result<ArbExecution> {
+        if self.config.mode.dry_run {
+            return Ok(ArbExecution {
+                signal: signal.clone(),
+                order_up: OrderRequest {
+                    token_id: signal.token_id_up.clone(),
+                    side: Side::Buy,
+                    price: signal.ask_up,
+                    size: signal.max_quantity,
+                    order_type: OrderType::Fok,
+                    expiration: self.default_expiration(),
+                },
+                order_down: OrderRequest {
+                    token_id: signal.token_id_down.clone(),
+                    side: Side::Buy,
+                    price: signal.ask_down,
+                    size: signal.max_quantity,
+                    order_type: OrderType::Fok,
+                    expiration: self.default_expiration(),
+                },
+                status: ArbStatus::BothFilled {
+                    profit: round4(signal.net_profit * signal.max_quantity),
+                },
+                order_id_up: Some(format!("dry-batch-{}", Uuid::new_v4())),
+                order_id_down: Some(format!("dry-batch-{}", Uuid::new_v4())),
+            });
+        }
+
+        let chunk_size = round_to(chunk_usd / signal.total_cost, 2).max(1.0);
+        let mut total_filled = 0.0;
+        let mut last_order_id_up = None;
+        let mut last_order_id_down = None;
+        let mut total_profit = 0.0;
+
+        for i in 0..max_chunks {
+            let remaining = signal.max_quantity - total_filled;
+            if remaining <= 0.0 {
+                break;
+            }
+            let batch_size = round_to(chunk_size.min(remaining), 2);
+            if batch_size <= 0.0 {
+                break;
+            }
+
+            // 重新检查当前 best ask
+            let Some((ask_up, _, ask_down, _)) =
+                books.get_pair_asks(&signal.token_id_up, &signal.token_id_down)
+            else {
+                break;
+            };
+            let sum = ask_up + ask_down;
+            let fees = sum * self.config.strategy.taker_fee_rate;
+            let gas = self.config.strategy.gas_per_order * 2.0;
+            if sum + fees + gas >= 1.0 {
+                break;
+            }
+
+            let expiration = self.default_expiration();
+            let order_up = OrderRequest {
+                token_id: signal.token_id_up.clone(),
+                side: Side::Buy,
+                price: ask_up,
+                size: batch_size,
+                order_type: OrderType::Fok,
+                expiration,
+            };
+            let order_down = OrderRequest {
+                token_id: signal.token_id_down.clone(),
+                side: Side::Buy,
+                price: ask_down,
+                size: batch_size,
+                order_type: OrderType::Fok,
+                expiration,
+            };
+
+            let (up_result, down_result) = if self.config.optimization.use_batch_orders {
+                let results = self
+                    .submit_orders_batch(&[order_up.clone(), order_down.clone()])
+                    .await?;
+                if results.len() != 2 {
+                    break;
+                }
+                (results[0].clone(), results[1].clone())
+            } else {
+                let (ur, dr) = tokio::join!(
+                    self.submit_single_order(&signal.token_id_up, Side::Buy, ask_up, batch_size),
+                    self.submit_single_order(
+                        &signal.token_id_down,
+                        Side::Buy,
+                        ask_down,
+                        batch_size
+                    ),
+                );
+                (ur?, dr?)
+            };
+
+            let up_filled = result_is_filled(&up_result);
+            let down_filled = result_is_filled(&down_result);
+            if up_filled && down_filled {
+                total_filled += batch_size;
+                total_profit += (1.0 - sum - fees - gas) * batch_size;
+                last_order_id_up = up_result.order_id.clone();
+                last_order_id_down = down_result.order_id.clone();
+            } else {
+                // 如果一侧成功另一侧失败，停止后续批次
+                break;
+            }
+
+            if i + 1 < max_chunks && delay_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        let status = if total_filled > 0.0 {
+            ArbStatus::BothFilled {
+                profit: round4(total_profit),
+            }
+        } else {
+            ArbStatus::BothCancelled
+        };
+
+        Ok(ArbExecution {
+            signal: signal.clone(),
+            order_up: OrderRequest {
+                token_id: signal.token_id_up.clone(),
+                side: Side::Buy,
+                price: signal.ask_up,
+                size: total_filled,
+                order_type: OrderType::Fok,
+                expiration: self.default_expiration(),
+            },
+            order_down: OrderRequest {
+                token_id: signal.token_id_down.clone(),
+                side: Side::Buy,
+                price: signal.ask_down,
+                size: total_filled,
+                order_type: OrderType::Fok,
+                expiration: self.default_expiration(),
+            },
+            status,
+            order_id_up: last_order_id_up,
+            order_id_down: last_order_id_down,
+        })
     }
 
     pub async fn handle_one_side_fill(

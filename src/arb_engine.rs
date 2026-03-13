@@ -36,6 +36,8 @@ pub struct ArbSignal {
     pub position_notional: f64,
     pub profit_rate: f64,
     pub time_to_expiry_sec: i64,
+    pub vwap_up: f64,
+    pub vwap_down: f64,
     pub books_stale: bool,
     pub timestamp: DateTime<Utc>,
 }
@@ -64,15 +66,30 @@ impl ArbEngine {
     }
 
     pub fn evaluate_pair(&self, pair: &MarketPair, books: &OrderBookManager) -> Option<ArbSignal> {
-        let (ask_up, size_up, ask_down, size_down) =
+        let (ask_up, _size_up, ask_down, _size_down) =
             books.get_pair_asks(&pair.token_id_up, &pair.token_id_down)?;
         let up_book = books.get_book(&pair.token_id_up)?;
         let down_book = books.get_book(&pair.token_id_down)?;
         let books_stale = up_book.is_stale(std::time::Duration::from_millis(STALE_THRESHOLD_MS))
             || down_book.is_stale(std::time::Duration::from_millis(STALE_THRESHOLD_MS));
-        let total_cost = ask_up + ask_down;
-        let fees = total_cost * self.config.taker_fee_rate;
+
         let gas = self.config.gas_per_order * 2.0;
+        let position_limited = if (ask_up + ask_down) > 0.0 {
+            self.config.max_position_usd / (ask_up + ask_down)
+        } else {
+            0.0
+        };
+
+        let depth = books.get_pair_depth(
+            &pair.token_id_up,
+            &pair.token_id_down,
+            position_limited,
+            self.config.taker_fee_rate,
+            gas,
+        )?;
+
+        let total_cost = depth.vwap_up + depth.vwap_down;
+        let fees = total_cost * self.config.taker_fee_rate;
         let net_profit = 1.0 - total_cost - fees - gas;
         if net_profit <= self.config.min_profit {
             return None;
@@ -83,12 +100,7 @@ impl ArbEngine {
             return None;
         }
 
-        let depth_limited = size_up.min(size_down);
-        let position_limited = if total_cost > 0.0 {
-            self.config.max_position_usd / total_cost
-        } else {
-            0.0
-        };
+        let depth_limited = depth.max_profitable_size;
         let max_quantity = round4(depth_limited.min(position_limited));
         if max_quantity <= 0.0 {
             return None;
@@ -110,6 +122,8 @@ impl ArbEngine {
             } else {
                 0.0
             },
+            vwap_up: depth.vwap_up,
+            vwap_down: depth.vwap_down,
             time_to_expiry_sec,
             books_stale,
             timestamp: Utc::now(),

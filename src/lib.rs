@@ -11,4 +11,5 @@ pub mod store;
 pub mod types;
 pub mod web;
 pub mod ws_market;
+pub mod merger;
 pub mod ws_user;

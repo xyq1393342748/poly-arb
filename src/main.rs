@@ -13,6 +13,7 @@ use poly_arb::{
     config::Config,
     logger::{init_tracing, Logger},
     market_discovery::{MarketDiscovery, MarketEvent, MarketInfo},
+    merger::Merger,
     order_manager::{ArbExecution, ArbStatus, OrderManager},
     orderbook::OrderBookManager,
     risk::{RiskManager, RiskVeto},
@@ -77,6 +78,7 @@ async fn main() -> Result<()> {
     let market_ws = MarketWsClient::new(&config, &auth);
     let user_ws = UserWsClient::new(&config, &auth);
     let order_manager = OrderManager::new(&config, auth.clone(), signer.clone());
+    let merger = Merger::new(&config);
     let mut risk = RiskManager::new(&config.risk);
     let mut books = OrderBookManager::default();
     let mut engine = ArbEngine::new(config.strategy.clone());
@@ -171,11 +173,37 @@ async fn main() -> Result<()> {
                                 expected_profit: signal.net_profit * signal.max_quantity,
                             }));
 
-                            let mut execution = order_manager.execute_arb(signal.clone()).await?;
+                            let mut execution = order_manager.execute_arb(signal.clone(), Some(&books)).await?;
                             if matches!(execution.status, ArbStatus::OneSideFilled { .. }) {
                                 order_manager
                                     .handle_one_side_fill(&mut execution, &books)
                                     .await?;
+                            }
+                            // MERGE: 如果双边成交且启用了 merge，立即合并回收 USDC
+                            if config.merge.enabled {
+                                if let ArbStatus::BothFilled { profit } = &execution.status {
+                                    let merge_profit = *profit;
+                                    match merger.merge_positions(&signal.condition_id, execution.signal.max_quantity).await {
+                                        Ok(result) if result.success => {
+                                            execution.status = ArbStatus::Merged {
+                                                profit: merge_profit,
+                                                tx_hash: result.tx_hash.unwrap_or_default(),
+                                            };
+                                        }
+                                        Ok(result) => {
+                                            execution.status = ArbStatus::MergeFailed {
+                                                profit: merge_profit,
+                                                reason: result.error.unwrap_or_else(|| "unknown".to_owned()),
+                                            };
+                                        }
+                                        Err(e) => {
+                                            execution.status = ArbStatus::MergeFailed {
+                                                profit: merge_profit,
+                                                reason: e.to_string(),
+                                            };
+                                        }
+                                    }
+                                }
                             }
                             let trade_id = persist_execution(&store, &execution).await?;
                             logger.log_execution(&execution);
@@ -322,6 +350,14 @@ fn apply_execution_risk(risk: &mut RiskManager, execution: &ArbExecution) {
             risk.record_one_side();
             risk.record_trade_result(-loss);
         }
+        ArbStatus::Merged { profit, .. } => {
+            risk.record_both_filled();
+            risk.record_trade_result(*profit);
+        }
+        ArbStatus::MergeFailed { profit, .. } => {
+            risk.record_both_filled();
+            risk.record_trade_result(*profit);
+        }
         ArbStatus::Pending | ArbStatus::BothCancelled | ArbStatus::Error(_) => {}
     }
 }
@@ -345,6 +381,14 @@ async fn update_daily_stats(store: &Store, execution: &ArbExecution) -> Result<D
             stats.total_profit -= *loss;
         }
         ArbStatus::OneSideFilled { .. } => stats.losses += 1,
+        ArbStatus::Merged { profit, .. } => {
+            stats.wins += 1;
+            stats.total_profit += *profit;
+        }
+        ArbStatus::MergeFailed { profit, .. } => {
+            stats.wins += 1;
+            stats.total_profit += *profit;
+        }
         ArbStatus::BothCancelled => stats.cancelled += 1,
         ArbStatus::Pending | ArbStatus::Error(_) => {}
     }
@@ -359,6 +403,8 @@ fn execution_status_label(execution: &ArbExecution) -> &'static str {
         ArbStatus::OneSideFilled { .. } => "ONE_SIDE",
         ArbStatus::Rescued { .. } => "RESCUED",
         ArbStatus::LossStopped { .. } => "LOSS_STOPPED",
+        ArbStatus::Merged { .. } => "MERGED",
+        ArbStatus::MergeFailed { .. } => "MERGE_FAILED",
         ArbStatus::BothCancelled => "BOTH_CANCELLED",
         ArbStatus::Error(_) => "ERROR",
     }
@@ -367,6 +413,8 @@ fn execution_status_label(execution: &ArbExecution) -> &'static str {
 fn execution_realized_profit(execution: &ArbExecution) -> Option<f64> {
     match &execution.status {
         ArbStatus::BothFilled { profit } => Some(*profit),
+        ArbStatus::Merged { profit, .. } => Some(*profit),
+        ArbStatus::MergeFailed { profit, .. } => Some(*profit),
         ArbStatus::Rescued { actual_profit } => Some(*actual_profit),
         ArbStatus::LossStopped { loss } => Some(-*loss),
         ArbStatus::Pending

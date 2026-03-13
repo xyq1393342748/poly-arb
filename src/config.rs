@@ -16,6 +16,8 @@ pub struct Config {
     pub mode: ModeConfig,
     pub web: WebConfig,
     pub store: StoreConfig,
+    #[serde(default)]
+    pub merge: MergeConfig,
 }
 
 impl Default for Config {
@@ -30,6 +32,7 @@ impl Default for Config {
             mode: ModeConfig::default(),
             web: WebConfig::default(),
             store: StoreConfig::default(),
+            merge: MergeConfig::default(),
         }
     }
 }
@@ -187,6 +190,27 @@ pub struct StrategyConfig {
     pub max_position_usd: f64,
     pub taker_fee_rate: f64,
     pub gas_per_order: f64,
+    #[serde(default = "default_batch_enabled")]
+    pub batch_enabled: bool,
+    #[serde(default = "default_batch_chunk_usd")]
+    pub batch_chunk_usd: f64,
+    #[serde(default = "default_batch_max_chunks")]
+    pub batch_max_chunks: u32,
+    #[serde(default = "default_batch_delay_ms")]
+    pub batch_delay_ms: u64,
+}
+
+fn default_batch_enabled() -> bool {
+    true
+}
+fn default_batch_chunk_usd() -> f64 {
+    75.0
+}
+fn default_batch_max_chunks() -> u32 {
+    10
+}
+fn default_batch_delay_ms() -> u64 {
+    100
 }
 
 impl Default for StrategyConfig {
@@ -196,6 +220,10 @@ impl Default for StrategyConfig {
             max_position_usd: 50.0,
             taker_fee_rate: 0.001,
             gas_per_order: 0.007,
+            batch_enabled: true,
+            batch_chunk_usd: 75.0,
+            batch_max_chunks: 10,
+            batch_delay_ms: 100,
         }
     }
 }
@@ -306,6 +334,28 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             db_path: "data/poly_arb.db".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MergeConfig {
+    pub enabled: bool,
+    pub polygon_rpc_url: String,
+    pub merge_gas_limit: u64,
+    pub merge_timeout_sec: u64,
+    pub max_gas_price_gwei: f64,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            polygon_rpc_url: "https://polygon-rpc.com".to_owned(),
+            merge_gas_limit: 200_000,
+            merge_timeout_sec: 30,
+            max_gas_price_gwei: 100.0,
         }
     }
 }
